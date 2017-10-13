@@ -20,7 +20,7 @@ import {
 } from "../../core"
 import { addHiddenFinalProp, fail, isMutable, isArray, isPlainObject } from "../../utils"
 import { ComplexType, IComplexType, IType } from "../type"
-import { TypeFlags, isType } from "../type-flags"
+import { TypeFlags, isType, isObjectType, isIdentifierType } from "../type-flags"
 import {
     typecheck,
     flattenTypeErrors,
@@ -29,6 +29,11 @@ import {
     IValidationResult,
     typeCheckFailure
 } from "../type-checker"
+import { ModelType } from "./model"
+
+export type ArrayTypeConfig = {
+    serializeAsMap?: boolean
+}
 
 export function arrayToString(this: IObservableArray<any> & IStateTreeNode) {
     return `${getStateTreeNode(this)}(${this.length} items)`
@@ -37,11 +42,25 @@ export function arrayToString(this: IObservableArray<any> & IStateTreeNode) {
 export class ArrayType<S, T> extends ComplexType<S[], IObservableArray<T>> {
     shouldAttachNode = true
     subType: IType<any, any>
+    subIdentifierAttribute?: string
     readonly flags = TypeFlags.Array
 
-    constructor(name: string, subType: IType<any, any>) {
+    constructor(name: string, subType: IType<any, any>, opts?: ArrayTypeConfig) {
         super(name)
         this.subType = subType
+
+        if (subType instanceof ModelType && opts && opts.serializeAsMap == true) {
+            let properties = subType.properties
+
+            for (let propertyName in properties) {
+                let property = properties[propertyName]
+
+                if (isIdentifierType(property)) {
+                    this.subIdentifierAttribute = propertyName
+                    break
+                }
+            }
+        }
     }
 
     describe() {
@@ -107,12 +126,20 @@ export class ArrayType<S, T> extends ComplexType<S[], IObservableArray<T>> {
                     this.subType,
                     childNodes.slice(index, index + removedCount),
                     added,
-                    added.map((_, i) => index + i)
+                    added.map(
+                        (_, i) =>
+                            this.subIdentifierAttribute ? _[this.subIdentifierAttribute] : index + 1
+                    )
                 )
 
                 // update paths of remaining items
                 for (let i = index + removedCount; i < childNodes.length; i++) {
-                    childNodes[i].setParent(node, "" + (i + added.length - removedCount))
+                    childNodes[i].setParent(
+                        node,
+                        this.subIdentifierAttribute
+                            ? childNodes[i].snapshot[this.subIdentifierAttribute]
+                            : "" + (i + added.length - removedCount)
+                    )
                 }
                 break
         }
@@ -129,12 +156,18 @@ export class ArrayType<S, T> extends ComplexType<S[], IObservableArray<T>> {
 
     didChange(this: {}, change: IArrayChange<any> | IArraySplice<any>): void {
         const node = getStateTreeNode(change.object as IStateTreeNode)
+        let subIdentifierAttribute
+        if (node.type instanceof ArrayType && node.type.subIdentifierAttribute) {
+            subIdentifierAttribute = node.type.subIdentifierAttribute
+        }
         switch (change.type) {
             case "update":
                 return void node.emitPatch(
                     {
                         op: "replace",
-                        path: "" + change.index,
+                        path: subIdentifierAttribute
+                            ? change.newValue.snapshot[subIdentifierAttribute]
+                            : "" + change.index,
                         value: change.newValue.snapshot,
                         oldValue: change.oldValue ? change.oldValue.snapshot : undefined
                     },
@@ -145,7 +178,9 @@ export class ArrayType<S, T> extends ComplexType<S[], IObservableArray<T>> {
                     node.emitPatch(
                         {
                             op: "remove",
-                            path: "" + (change.index + i),
+                            path: subIdentifierAttribute
+                                ? change.removed[i].snapshot[subIdentifierAttribute]
+                                : "" + (change.index + i),
                             oldValue: change.removed[i].snapshot
                         },
                         node
@@ -154,7 +189,11 @@ export class ArrayType<S, T> extends ComplexType<S[], IObservableArray<T>> {
                     node.emitPatch(
                         {
                             op: "add",
-                            path: "" + (change.index + i),
+                            path: subIdentifierAttribute
+                                ? node.getChildNode("" + (change.index + i)).snapshot[
+                                      subIdentifierAttribute
+                                  ]
+                                : "" + (change.index + i),
                             value: node.getChildNode("" + (change.index + i)).snapshot,
                             oldValue: undefined
                         },
@@ -235,12 +274,18 @@ export class ArrayType<S, T> extends ComplexType<S[], IObservableArray<T>> {
  * @param {IType<S, T>} subtype
  * @returns {IComplexType<S[], IObservableArray<T>>}
  */
-export function array<S, T>(subtype: IType<S, T>): IComplexType<S[], IObservableArray<T>> {
+export function array<S, T>(
+    subtype: IType<S, T>,
+    opts?: ArrayTypeConfig
+): IComplexType<S[], IObservableArray<T>> {
     if (process.env.NODE_ENV !== "production") {
         if (!isType(subtype))
             fail("expected a mobx-state-tree type as first argument, got " + subtype + " instead")
     }
-    return new ArrayType<S, T>(subtype.name + "[]", subtype)
+    if (opts && opts.serializeAsMap == true && !isObjectType(subtype)) {
+        fail("serializeAsMap set to true, but subtype " + subtype + " is not a model")
+    }
+    return new ArrayType<S, T>(subtype.name + "[]", subtype, opts)
 }
 
 function reconcileArrayChildren<T>(
